@@ -29,6 +29,37 @@ root or additional permissions. The button and physical single-tap interaction w
 in a local adaptation on the [QCREA YYD-1156](../../docs/qcrea-yyd-1156.md); the saved opt-in is
 the shared-kiosk version of that adaptation.
 
+## Optional host PIN for the controls
+
+On a frame that other people use, such as a guest room, the controls open Android settings, so
+anyone can leave the dashboard. Save a PIN to ask for it first. Only its SHA-256 is stored, so
+hash it on your computer and send the hash, keeping the PIN out of your shell history:
+
+```sh
+read -rsp "PIN: " pin; echo
+adb shell am start -n com.wesbos.homehq/.MainActivity \
+  --es menu_pin_sha256 "$(printf '%s' "$pin" | shasum -a 256 | cut -d' ' -f1)"
+unset pin
+```
+
+The PIN then guards the two-finger controls, the Menu button, and the **Open Wi-Fi settings**
+and Wi-Fi sign-in buttons on the offline screen. Five wrong tries lock it for a minute. Send
+`--es menu_pin_sha256 ""` to remove it. A forgotten PIN is cleared the same way over ADB.
+
+## Optional page brightness control
+
+A dashboard can dim the backlight, for example for a night clock in a bedroom, once you allow it:
+
+```sh
+adb shell am start -n com.wesbos.homehq/.MainActivity --ez page_brightness true
+```
+
+The saved dashboard then gets `window.HomeHQ.setBrightness(level)`. A level from 0 to 1 sets
+this window's backlight (0 is the panel's lowest level, not off), and a negative level hands
+brightness back to Android. It returns `true` when applied. Only pages from the saved URL's
+origin can use it, and every page load resets the brightness. `--ez page_brightness false`
+turns it off. The screen stays on, so the page keeps running at the lowest level.
+
 ## Clear a vendor boot animation that covers the kiosk
 
 Some frames keep a vendor boot animation on top of every window after Android has finished

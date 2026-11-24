@@ -24,11 +24,13 @@ import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
 import android.util.TypedValue;
+import android.text.InputType;
 import android.view.Gravity;
 import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
+import android.webkit.JavascriptInterface;
 import android.webkit.SslErrorHandler;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -36,6 +38,7 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -43,6 +46,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -76,6 +81,11 @@ public class MainActivity extends Activity {
   static final String PREFS = "kiosk";
   static final String PREF_URL = "url";
   static final String PREF_MENU_BUTTON = "menu_button";
+  static final String PREF_MENU_PIN = "menu_pin_sha256";
+  static final String PREF_PAGE_BRIGHTNESS = "page_brightness";
+  static final float MIN_PAGE_BRIGHTNESS = 1f / 255;
+  static final int PIN_MAX_TRIES = 5;
+  static final long PIN_LOCKOUT_MS = 60000;
   static final String PREF_BOOTANIM_EXIT = "bootanim_exit";
   static final long EXIT_HOLD_MS = 1500;
   static final int CANCEL_POINTER_IDS = 10; // touch ids 0-9
@@ -108,6 +118,8 @@ public class MainActivity extends Activity {
   private boolean exitArmed;
   private String retryUrl;
   private String mainUrl;
+  // The page the brightness bridge answers for; read on WebView's JavaScript thread.
+  private volatile String bridgePage;
   private boolean pageFailed;
   // A retry is queued: keep the offline screen up until it runs, even if the failed load "finishes".
   private boolean retryPending;
@@ -170,6 +182,14 @@ public class MainActivity extends Activity {
       handler.removeCallbacks(showControls);
       Log.i(TAG, "Opening kiosk controls");
       cancelPageTouches();
+      requirePin(() -> showControlsMenu());
+    }
+  };
+
+  private int pinFailures;
+  private long pinLockedUntil;
+
+  private void showControlsMenu() {
       new AlertDialog.Builder(MainActivity.this)
           .setTitle("Home HQ")
           .setItems(new String[] {"Open launcher", "Android settings", "Wi-Fi settings", "Reload dashboard"},
@@ -180,8 +200,62 @@ public class MainActivity extends Activity {
                 else web.reload();
               })
           .setNegativeButton("Back to dashboard", null).show();
+  }
+
+  private String menuPinHash() {
+    return getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_MENU_PIN, "");
+  }
+
+  private static String sha256(String value) throws Exception {
+    byte[] digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
+    StringBuilder hex = new StringBuilder();
+    for (byte b : digest) hex.append(String.format(Locale.US, "%02x", b));
+    return hex.toString();
+  }
+
+  /** Runs next only after the owner PIN, when one is set. Unset keeps the stock open menu. */
+  private void requirePin(Runnable next) {
+    String expected = menuPinHash();
+    if (expected.isEmpty()) {
+      next.run();
+      return;
     }
-  };
+    if (SystemClock.elapsedRealtime() < pinLockedUntil) return;
+    EditText input = new EditText(this);
+    input.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+    input.setGravity(Gravity.CENTER);
+    new AlertDialog.Builder(this)
+        .setTitle("Host PIN")
+        .setView(input)
+        .setPositiveButton("OK", (dialog, which) -> {
+          boolean ok = false;
+          try {
+            ok = MessageDigest.isEqual(sha256(input.getText().toString()).getBytes(StandardCharsets.UTF_8),
+                expected.getBytes(StandardCharsets.UTF_8));
+          } catch (Exception e) {
+            Log.w(TAG, "PIN check failed");
+          }
+          if (ok) {
+            pinFailures = 0;
+            next.run();
+          } else if (++pinFailures >= PIN_MAX_TRIES) {
+            pinFailures = 0;
+            pinLockedUntil = SystemClock.elapsedRealtime() + PIN_LOCKOUT_MS;
+          }
+        })
+        .setNegativeButton("Cancel", null).show();
+  }
+
+  private void applyPinFlag(Intent intent) {
+    if (intent == null || !intent.hasExtra(PREF_MENU_PIN)) return;
+    String hash = intent.getStringExtra(PREF_MENU_PIN);
+    if (hash == null || !(hash.isEmpty() || hash.matches("[0-9a-f]{64}"))) {
+      Log.w(TAG, "Ignored invalid menu PIN hash");
+      return;
+    }
+    getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(PREF_MENU_PIN, hash).commit();
+    Log.i(TAG, "Menu PIN " + (hash.isEmpty() ? "off" : "on"));
+  }
 
   @Override
   protected void onCreate(Bundle state) {
@@ -200,6 +274,7 @@ public class MainActivity extends Activity {
     s.setDomStorageEnabled(true);
     s.setUseWideViewPort(true);
     s.setMediaPlaybackRequiresUserGesture(false);
+    web.addJavascriptInterface(new PageBridge(), "HomeHQ");
     // Keep navigation inside the kiosk. When the kiosk starts at boot before Wi-Fi is up, the
     // first load fails and would stay on the error page, so retry failed main-frame loads.
     // The offline screen covers WebView's error page until a load succeeds.
@@ -213,6 +288,8 @@ public class MainActivity extends Activity {
       public void onPageStarted(WebView view, String url, Bitmap icon) {
         pageFailed = false;
         mainUrl = url;
+        bridgePage = url;
+        setWindowBrightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE);
       }
 
       @Override
@@ -323,6 +400,8 @@ public class MainActivity extends Activity {
     menuPosition.setMargins(dp(12), dp(12), dp(12), dp(12));
     root.addView(menuButton, menuPosition);
     applyMenuButtonFlag(getIntent());
+    applyPinFlag(getIntent());
+    applyPageBrightnessFlag(getIntent());
     setContentView(root);
 
     String url = urlFrom(getIntent());
@@ -373,6 +452,8 @@ public class MainActivity extends Activity {
     applyHomeFlag(intent);
     applyBootFlag(intent);
     applyMenuButtonFlag(intent);
+    applyPinFlag(intent);
+    applyPageBrightnessFlag(intent);
     applyBootanimFlag(intent);
     String url = urlFrom(intent);
     if (url != null) {
@@ -503,7 +584,7 @@ public class MainActivity extends Activity {
     wifi.setText("Open Wi-Fi settings");
     wifi.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
     wifi.setPadding(dp(32), dp(16), dp(32), dp(16));
-    wifi.setOnClickListener(v -> openWifiSettings());
+    wifi.setOnClickListener(v -> requirePin(() -> openWifiSettings()));
     offline.addView(wifi, new LinearLayout.LayoutParams(
         LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
@@ -512,7 +593,7 @@ public class MainActivity extends Activity {
     signIn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
     signIn.setPadding(dp(32), dp(16), dp(32), dp(16));
     signIn.setVisibility(View.GONE);
-    signIn.setOnClickListener(v -> openPortal());
+    signIn.setOnClickListener(v -> requirePin(() -> openPortal()));
     LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
         LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
     lp.topMargin = dp(16);
@@ -817,6 +898,46 @@ public class MainActivity extends Activity {
     boolean debug = intent != null && intent.getBooleanExtra("debug", false);
     WebView.setWebContentsDebuggingEnabled(debug);
     Log.i(TAG, "WebView remote debugging " + (debug ? "ON" : "off"));
+  }
+
+  /** A saved opt-in that lets the saved dashboard dim the backlight, e.g. for a night clock. */
+  private void applyPageBrightnessFlag(Intent intent) {
+    if (intent == null || !intent.hasExtra(PREF_PAGE_BRIGHTNESS)) return;
+    boolean on = intent.getBooleanExtra(PREF_PAGE_BRIGHTNESS, false);
+    getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_PAGE_BRIGHTNESS, on).apply();
+    if (!on) setWindowBrightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE);
+    Log.i(TAG, "Page brightness control " + (on ? "on" : "off"));
+  }
+
+  private void setWindowBrightness(float value) {
+    WindowManager.LayoutParams lp = getWindow().getAttributes();
+    if (lp.screenBrightness == value) return;
+    lp.screenBrightness = value;
+    getWindow().setAttributes(lp);
+  }
+
+  static boolean sameOrigin(String a, String b) {
+    if (a == null || b == null) return false;
+    Uri x = Uri.parse(a), y = Uri.parse(b);
+    return x.getScheme() != null && x.getHost() != null && x.getScheme().equalsIgnoreCase(y.getScheme())
+        && x.getHost().equalsIgnoreCase(y.getHost()) && x.getPort() == y.getPort();
+  }
+
+  /**
+   * window.HomeHQ.setBrightness(level) for the saved dashboard only, and only after the
+   * page_brightness opt-in. 0-1 dims this window's backlight (clamped above off); a negative
+   * level hands brightness back to Android. Every page load resets it.
+   */
+  final class PageBridge {
+    @JavascriptInterface
+    public boolean setBrightness(float level) {
+      if (Float.isNaN(level) || !sameOrigin(bridgePage, savedUrl())
+          || !getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_PAGE_BRIGHTNESS, false)) return false;
+      float value = level < 0 ? WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+          : Math.max(MIN_PAGE_BRIGHTNESS, Math.min(1f, level));
+      handler.post(() -> setWindowBrightness(value));
+      return true;
+    }
   }
 
   /** A saved opt-in for panels where the two-finger gesture is unreliable. */
